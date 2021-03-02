@@ -31,6 +31,7 @@ import (
 	"strings"
 )
 
+// 系统的 which 指令
 func which(bins ...string) ([]string, error) {
 	paths := make([]string, 0, len(bins))
 
@@ -56,15 +57,19 @@ func which(bins ...string) ([]string, error) {
 	return paths, nil
 }
 
+// clone 返回会先尝试硬链接过去，若失败就直接复制过去
 func clone(src, dst string) error {
 	// Prefer hard link, fallback to copy
+	// 先尝试硬链接过去
 	err := os.Link(src, dst)
 	if err != nil {
+		// 硬链接失败就直接复制过去
 		err = fallbackCopy(src, dst)
 	}
 	return err
 }
 
+// clone 尝试硬链接失败，直接复制过去
 func fallbackCopy(src, dst string) error {
 	s, err := os.Open(src)
 	if err != nil {

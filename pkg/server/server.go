@@ -35,10 +35,11 @@ import (
 	deviceFactory "tkestack.io/gpu-manager/pkg/device"
 	containerRuntime "tkestack.io/gpu-manager/pkg/runtime"
 	allocFactory "tkestack.io/gpu-manager/pkg/services/allocator"
+
 	// Register allocator controller
 	_ "tkestack.io/gpu-manager/pkg/services/allocator/register"
 	"tkestack.io/gpu-manager/pkg/services/display"
-	"tkestack.io/gpu-manager/pkg/services/virtual-manager"
+	vitrual_manager "tkestack.io/gpu-manager/pkg/services/virtual-manager"
 	"tkestack.io/gpu-manager/pkg/services/volume"
 	"tkestack.io/gpu-manager/pkg/services/watchdog"
 	"tkestack.io/gpu-manager/pkg/types"
@@ -59,14 +60,23 @@ import (
 )
 
 type managerImpl struct {
+
+	// config 中的参数同 cmd/manager/options/options.go 中传入的参数
 	config *config.Config
 
-	allocator      allocFactory.GPUTopoService
-	displayer      *display.Display
+	// 负责在容器调度到节点上，为其分配具体的设备资源
+	// allocator 实现了探测节点上的 GPU 拓扑架构
+	// 以最佳性能，最少碎片为目的的使用最优方案进行资源分配
+	allocator allocFactory.GPUTopoService
+	// 将 gpu 的使用情况输出，方便查看 (?哪里用上了?)
+	displayer *display.Display
+	// 负责 vgpu 分配后的管理工作
 	virtualManager *vitrual_manager.VirtualManager
 
+	// 包含 vcore vmemory，这两种资源是以 device plugin 的方式进行注册，所以他们需要启动 grpc server
 	bundleServer map[string]ResourceServer
-	srv          *grpc.Server
+	// 将 gpu display server 注册到 grpc server 中
+	srv *grpc.Server
 }
 
 //NewManager creates and returns a new managerImpl struct
@@ -171,6 +181,7 @@ func (m *managerImpl) Run() error {
 	tree.Init("")
 	tree.Update()
 
+	// 初始化资源分配器，这里的 initAllocator 对应的方法是 func NewNvidiaTopoAllocator(config *config.Config, tree device.GPUTree, k8sClient kubernetes.Interface) allocator.GPUTopoService
 	initAllocator := allocFactory.NewFuncForName(m.config.Driver)
 	if initAllocator == nil {
 		return fmt.Errorf("can not find allocator for %s", m.config.Driver)
@@ -311,6 +322,21 @@ func (m *managerImpl) Version(ctx context.Context, req *google_protobuf1.Empty) 
 	return m.displayer.Version(ctx, req)
 }
 
+// Device Plugin 的注册
+
+// Device Plugin 工作时序图
+// [device plugin]										 [kubelet]						[api server]				 [user]
+//		| -> 注册 (Unix socket, api server. ResourceName) ->	|								|							|
+//		| -> ListAnWatch 发送当前节点上的设备资源 Foo		 ->	|								|							|
+//		|													| -> 通过节点状态更新资源状态     ->	|							|
+//		|													|								| <- 创建 pod，请求 Foo 资源<-	|
+//		|													| <- 根据节点状态进行 pod 调度	 <-	|							|
+//		| <- 调用 Allocate 进行资源分配						|								|							|
+// [device plugin]										 [kubelet]						[api server]				 [user]
+
+// gpu-manager 的注册方法
+// 这里分别注册了 vcuda 和 vmemory
+// vcuda 和 vmemory 的 Allocate 方法都指向了同一个方法，写在 service/allocator/nvidia/allocator.go 中 (?怎么看出来的?)
 func (m *managerImpl) RegisterToKubelet() error {
 	socketFile := filepath.Join(m.config.DevicePluginPath, types.KubeletSocket)
 	dialOptions := []grpc.DialOption{grpc.WithInsecure(), grpc.WithDialer(utils.UnixDial), grpc.WithBlock(), grpc.WithTimeout(time.Second * 5)}
@@ -340,3 +366,22 @@ func (m *managerImpl) RegisterToKubelet() error {
 
 	return nil
 }
+
+// 至此，gpu-manager 的启动流程结束
+// 接下来 gpu-manager 的职责就是等待 kubelet 通过 grpc 调用
+
+//
+//										|- vcore
+//										|- vmemroy
+//					|- server			|- display
+//										|- metrics
+//
+//					|- virtualmanger	|- vcuda
+//
+//	｜- gpu-manager	|- volume manager
+//
+// 					|- allocator
+//
+//										｜- link
+//					|- nvidia 的拓扑感知	｜- share
+//										｜- fragment

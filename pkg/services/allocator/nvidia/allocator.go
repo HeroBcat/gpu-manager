@@ -41,7 +41,7 @@ import (
 	"tkestack.io/gpu-manager/pkg/utils"
 
 	"golang.org/x/net/context"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -63,7 +63,7 @@ func init() {
 	allocator.Register("nvidia_test", NewNvidiaTopoAllocatorForTest)
 }
 
-//NvidiaTopoAllocator is an allocator for Nvidia GPU
+// NvidiaTopoAllocator is an allocator for Nvidia GPU
 type NvidiaTopoAllocator struct {
 	sync.Mutex
 
@@ -99,7 +99,7 @@ var (
 	waitTimeout                          = 10 * time.Second
 )
 
-//NewNvidiaTopoAllocator returns a new NvidiaTopoAllocator
+// NewNvidiaTopoAllocator returns a new NvidiaTopoAllocator
 func NewNvidiaTopoAllocator(config *config.Config, tree device.GPUTree, k8sClient kubernetes.Interface) allocator.GPUTopoService {
 	_tree, _ := tree.(*nvtree.NvidiaTree)
 	cm, err := checkpoint.NewManager(config.CheckpointPath, checkpointFileName)
@@ -117,29 +117,41 @@ func NewNvidiaTopoAllocator(config *config.Config, tree device.GPUTree, k8sClien
 		checkpointManager: cm,
 	}
 
+	// allocator 调用 loadModule() 来启动 nvidia 的内核模块
 	// Load kernel module if it's not loaded
 	alloc.loadModule()
 
+	// 初始化评估器
+	// 这里的 _tree 就是感知到的 GPU 拓扑结构
 	// Initialize evaluator
 	alloc.initEvaluator(_tree)
 
+	// 加载启动时传入的额外参数配置文件
 	// Read extra config if it's given
 	alloc.loadExtraConfig(config.ExtraConfigPath)
 
+	// 开启新的协程来处理分配结果
 	// Process allocation results in another goroutine
 	go wait.Until(alloc.runProcessResult, time.Second, alloc.stopChan)
 
+	// 恢复 gpu-manager 分配结果
+	// 比如在 gpu-manager 重启之后，之前的 gpu 分配结果都丢失了，但节点上还有大量的容器正在占用 gpu
+	// 这个方法通过查找节点上存活的容器，通过 docker endpoint 调用 InspectContainer 获取容器中占用的 device id (?怎么看出来的?)
+	// 然后标记改设备和容器之间的占用关系 (?怎么看出来的?)
 	// Recover
 	alloc.recoverInUsed()
 
+	// 创建新的协程来周期性的检查资源分配情况
+	// 如果是 Failed 和 Pending 状态的容器，就根据错误信息检查是否应该删除它们
+	// 然后如果这些 pod 的控制器是 deployment 类似的，就尝试删除它们，这样控制器会重新创建这些 pod 进行调度，让这些 pod 恢复到正常运行状态
 	// Check allocation in another goroutine periodically
 	go alloc.checkAllocationPeriodically(alloc.stopChan)
 
 	return alloc
 }
 
-//NewNvidiaTopoAllocatorForTest returns a new NvidiaTopoAllocator
-//with fake docker client, just for testing.
+// NewNvidiaTopoAllocatorForTest returns a new NvidiaTopoAllocator
+// with fake docker client, just for testing.
 func NewNvidiaTopoAllocatorForTest(config *config.Config, tree device.GPUTree, k8sClient kubernetes.Interface) allocator.GPUTopoService {
 	_tree, _ := tree.(*nvtree.NvidiaTree)
 	cm, err := checkpoint.NewManager("/tmp", checkpointFileName)
