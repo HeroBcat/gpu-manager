@@ -354,12 +354,17 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		allocated                   bool
 	)
 
+	// 是否是 gpu 预选 pod
 	predicateMissed = !utils.IsGPUPredicatedPod(pod)
+	// 单节点的总内存
 	singleNodeMemory := int64(ta.tree.Leaves()[0].Meta.TotalMemory)
+	// 根据有多少个 deviceID 来计算需要多少 core 和 memory
 	for _, v := range req.DevicesIDs {
 		if strings.HasPrefix(v, types.VCoreAnnotation) {
+			// 请求 core
 			needCores++
 		} else if strings.HasPrefix(v, types.VMemoryAnnotation) {
+			// 请求 memory
 			needMemoryBlocks++
 		}
 	}
@@ -369,6 +374,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		return nil, nil
 	}
 
+	// 回收资源
 	ta.recycle()
 
 	needMemory := needMemoryBlocks * types.MemoryBlockSize
@@ -398,7 +404,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		klog.V(2).Infof("Try allocate for %s(%s), vcore %d, vmemory %d", pod.UID, container.Name, needCores, needMemory)
 
 		switch {
-		case needCores > nvtree.HundredCore:
+		case needCores > nvtree.HundredCore: // 需要核心数大于 100，即超过一个物理GPU，使用 link 评估器选出 GPU 节点
 			eval, ok := ta.evaluators["link"]
 			if !ok {
 				return nil, fmt.Errorf("can not find evaluator link")
@@ -407,13 +413,14 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 				return nil, fmt.Errorf("cores are greater than %d, must be multiple of %d", nvtree.HundredCore, nvtree.HundredCore)
 			}
 			nodes = eval.Evaluate(needCores, 0)
-		case needCores == nvtree.HundredCore:
+		case needCores == nvtree.HundredCore: // 正好是 100 核心，使用 fragment 评估器
 			eval, ok := ta.evaluators["fragment"]
 			if !ok {
 				return nil, fmt.Errorf("can not find evaluator fragment")
 			}
 			nodes = eval.Evaluate(needCores, 0)
-		default:
+		default: // 小于 100 核心，即共享 GPU，使用 share 评估器
+			// EnableShare 是启动时指定的参数，代表是否允许多个容器共享一个 GPU
 			if !ta.config.EnableShare {
 				return nil, fmt.Errorf("share mode is not enabled")
 			}
@@ -438,6 +445,8 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 
 			if !predicateMissed {
 				// get predicate node by annotation
+				// 通过预选阶段的 pod 会根据容器的 idx 在 Annotations 为该容器写上配置信息
+				// 这说明 gpu-admission 会为容器分配 gpu 设备
 				containerIndex, err := utils.GetContainerIndexByName(pod, container.Name)
 				if err != nil {
 					return nil, err
@@ -460,6 +469,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 					return nil, fmt.Errorf("failed to get predicate node %s", devStr)
 				}
 
+				// 最后还要检查一下 gpu-manager 分配的 gpu 设备 和 gpu-admission 中是否一致，不一致会返回分配失败
 				// check if we choose the same node as scheduler
 				if predicateNode.MinorName() != nodes[0].MinorName() {
 					return nil, fmt.Errorf("Nvidia node mismatch for pod %s(%s), pick up:%s  predicate: %s",
@@ -477,6 +487,8 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		return nil, fmt.Errorf("no free node")
 	}
 
+	// 现在我们已经知道要为当前请求的容器分配哪个 gpu 设备，以及分配的资源数量
+	// 这样就可以构建 ContainerAllocateResponse
 	ctntResp := &pluginapi.ContainerAllocateResponse{
 		Envs:        make(map[string]string),
 		Mounts:      make([]*pluginapi.Mount, 0),
@@ -501,11 +513,13 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		deviceList = append(deviceList, n.Meta.UUID)
 
 		if !allocated {
+			// 在 gpu tree 中标记设备已占用
 			ta.tree.MarkOccupied(n, needCores, needMemory)
 		}
 		allocatedDevices.Insert(name)
 	}
 
+	// 更改响应的 Annotations:
 	ctntResp.Annotations[types.VDeviceAnnotation] = vDeviceAnnotationStr(nodes)
 	if !allocated {
 		ta.allocatedPod.Insert(string(pod.UID), container.Name, &cache.Info{
@@ -515,6 +529,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		})
 	}
 
+	// 检查 pod 的所有容器是否都完成了分配，并把新的分配信息写入 checkpoint
 	// check if all containers of pod has been allocated; set unfinishedPod if not
 	unfinished := false
 	for _, c := range pod.Spec.Containers {
@@ -536,6 +551,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 	}
 	ta.writeCheckpoint()
 
+	// 在 response 中为容器添加 /dev/nvidiactl 和 /dev/nvidia-uvm
 	// Append control device
 	ctntResp.Devices = append(ctntResp.Devices, &pluginapi.DeviceSpec{
 		ContainerPath: types.NvidiaCtlDevice,
@@ -549,6 +565,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		Permissions:   "rwm",
 	})
 
+	// 如果配置了 extraConfig，还要将里面要默认添加的设备加进去
 	// Append default device
 	if cfg, found := ta.extraConfig["default"]; found {
 		for _, dev := range cfg.Devices {
@@ -560,6 +577,10 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		}
 	}
 
+	// 至此，response 中的设备信息已经处理结束
+
+	// 接下来处理容器中的环境变量
+	// gpu-manager 需要通过修改 LD_LIBRARY_PATH 来劫持程序对 cuda 的调用
 	// LD_LIBRARY_PATH
 	ctntResp.Envs["LD_LIBRARY_PATH"] = "/usr/local/nvidia/lib64"
 	for _, env := range container.Env {
@@ -568,16 +589,20 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		}
 	}
 
+	// 然后通过 NVIDIA_VISIBLE_DEVICES 来让挂载的设备可见
 	// NVIDIA_VISIBLE_DEVICES
 	ctntResp.Envs["NVIDIA_VISIBLE_DEVICES"] = strings.Join(deviceList, ",")
 
+	// 根据是否处于 shareMode，也就是单个 GPU 是否被共享来挂载不同的 host 目录
 	if shareMode {
+		// nvidia 是被劫持的库，用于 shareMode 的情况下
 		ctntResp.Mounts = append(ctntResp.Mounts, &pluginapi.Mount{
 			ContainerPath: "/usr/local/nvidia",
 			HostPath:      types.DriverLibraryPath,
 			ReadOnly:      true,
 		})
 	} else {
+		// 非 shareMode 用原始的库即可
 		ctntResp.Mounts = append(ctntResp.Mounts, &pluginapi.Mount{
 			ContainerPath: "/usr/local/nvidia",
 			HostPath:      types.DriverOriginLibraryPath,
@@ -585,12 +610,16 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		})
 	}
 
+	// 将 host 上的 /etc/gpu-manager/vm/{podUID} 挂载到容器中
+	// 这个是为了容器内可以通过 vcuda.sock 和 vm 通信
 	ctntResp.Mounts = append(ctntResp.Mounts, &pluginapi.Mount{
 		ContainerPath: types.VCUDA_MOUNTPOINT,
 		HostPath:      filepath.Join(ta.config.VirtualManagerPath, string(pod.UID)),
 		ReadOnly:      true,
 	})
 
+	// 如果当前请求的容器所属 pod 没有经过 gpu-admission，还会被放到一个处理队列中
+	// 这个队列会在 pkg/service/allocator/nvidia/allocator.go 的 processResult 中处理 (补打/删除标签之类的操作)
 	if predicateMissed {
 		ar := &allocateResult{
 			pod:     pod,
@@ -600,6 +629,8 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 		ta.queue.AddRateLimited(ar)
 		<-ar.resChan
 	}
+
+	// 至此，kubelet 调用 Allocate 方法就结束了
 	return ctntResp, nil
 }
 
@@ -614,6 +645,7 @@ func (ta *NvidiaTopoAllocator) requestForVCuda(podUID string) error {
 }
 
 func (ta *NvidiaTopoAllocator) recycle() {
+
 	activePods := watchdog.GetActivePods()
 
 	lastActivePodUids := sets.NewString()
@@ -625,10 +657,12 @@ func (ta *NvidiaTopoAllocator) recycle() {
 		activePodUids.Insert(uid)
 	}
 
+	// difference 出来的就是已经运行结束的 pod，可以回收分配的 gpu 资源
 	podsToBeRemoved := lastActivePodUids.Difference(activePodUids)
 
 	klog.V(5).Infof("Pods to be removed: %v", podsToBeRemoved.List())
 
+	// 释放资源
 	ta.freeGPU(podsToBeRemoved.List())
 }
 
@@ -651,8 +685,26 @@ func (ta *NvidiaTopoAllocator) freeGPU(podUids []string) {
 	ta.writeCheckpoint()
 }
 
+// ----------------------------------------
+// gpu-manager 做的工作：
+// - 为容器挂载 cuda 相关的库，包括 vcuda-control 这个项目的拦截库
+// - 通过覆盖容器的 LD_LIBRARY_PATH 来将 cuda 调用指向 libcuda-control.so，这个库里面对显存和计算 api 做了拦截
+// - 为容器挂载 vcuda.sock，在容器调用特定的 cuda api 时，会触发 grpc 调用，通过 vcuda.sock 和 virtual manager 通信， vm 下发容器配置。这样拦截库就知道自己应该怎么限制容器了
+// ----------------------------------------
+
+// (pluginapi.)AllocateRequest (请求)里包含了每个容器需要的设备数组
+// - Allocate 是在 pod 创建时被调用，因为任何容器分配失败都会造成 pod 启动失败
+// - Allocate 允许 kubelet 在 pod 环境中引入更多的 artifacts，这部分工作用 device plugin 主导。对于 gpu-manager 来说就是覆盖容器中的 LD_LIBRARY_PATH，挂载 cuda 库文件等
+// - Allocate 允许 device plugin 在设备上运行特定的操作
+
+// (pluginapi.)AllocateResponse 为每个容器返回 ContainerAllocateResponse，包括容器的环境变量，容器的挂载，容器的设备信息，容器的 annotations 信息
+// 即在容器中挂载设备需要：
+// - 设备相对于容器的地址
+// - 设备在宿主机上的地址
+// - 设备的 Cgroups 信息
+
 // #lizard forgives
-//Allocate tries to allocate GPU node for each request
+// Allocate tries to allocate GPU node for each request
 func (ta *NvidiaTopoAllocator) Allocate(_ context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	ta.Lock()
 	defer ta.Unlock()
@@ -668,14 +720,18 @@ func (ta *NvidiaTopoAllocator) Allocate(_ context.Context, reqs *pluginapi.Alloc
 	}
 
 	// k8s send allocate request for one container at a time
+	// 取 Allocate 中的第一个 ContainerRequest，通过上一句的注释，k8s 一次只为一个容器发送分配请求
 	req := reqs.ContainerRequests[0]
 	resps := &pluginapi.AllocateResponse{}
 	reqCount = uint(len(req.DevicesIDs))
 
 	klog.V(4).Infof("Request GPU device: %s", strings.Join(req.DevicesIDs, ","))
 
+	// 因为 k8s 一次请求只针对一个容器，所以这里的 unfinishedPod 指的是还有部分容器尚未分配的 pod
 	if ta.unfinishedPod != nil {
+		// 候选 pod
 		candidatePod = ta.unfinishedPod
+		// 从已分配的 pod 中查找
 		cache := ta.allocatedPod.GetCache(string(candidatePod.UID))
 		if cache == nil {
 			msg := fmt.Sprintf("failed to find pod %s in cache", candidatePod.UID)
@@ -696,11 +752,17 @@ func (ta *NvidiaTopoAllocator) Allocate(_ context.Context, reqs *pluginapi.Alloc
 				klog.Infof(msg)
 				return nil, fmt.Errorf(msg)
 			}
+			// 候选的容器 (应该就是待分配资源的容器)
 			candidateContainer = &candidatePod.Spec.Containers[i]
 			found = true
 			break
+
+			// 上面的代码遍历了这个 pod 的容器列表，然后和缓存中的容器对比
+			// 如果没有分配并需要 gpu 资源，且容器请求的资源量和当前的分配请求一致
+			// 则认定这个容器就是接下来要为之分配的候选人
 		}
 	} else {
+		// 获取候选的 pod，候选的 pod 是当前节点上需要 GPU，但没有分配，且应该不会删除的 pod
 		pods, err := getCandidatePods(ta.k8sClient, ta.config.Hostname)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to find candidate pods due to %v", err)
@@ -736,11 +798,14 @@ func (ta *NvidiaTopoAllocator) Allocate(_ context.Context, reqs *pluginapi.Alloc
 
 	if found {
 		// get vmemory info from container spec
+		// 拿到容器的 vmemory 信息，vmemoery 是根据数量划分的，1 vmemory = 256 MB memory = 1 deviceID
+		// 所以这里请求多少个 vmemory 就会有多少个 deviceID
 		vmemory := utils.GetGPUResourceOfContainer(candidateContainer, types.VMemoryAnnotation)
 		for i := 0; i < int(vmemory); i++ {
 			req.DevicesIDs = append(req.DevicesIDs, types.VMemoryAnnotation)
 		}
 
+		// 调用 allocateOne 为单个容器进行真正的分配工作
 		resp, err := ta.allocateOne(candidatePod, candidateContainer, req)
 		if err != nil {
 			klog.Errorf(err.Error())
@@ -982,8 +1047,8 @@ func (ta *NvidiaTopoAllocator) processResult(ar *allocateResult) error {
 }
 
 func (ta *NvidiaTopoAllocator) getReadyAnnotations(pod *v1.Pod, assigned bool) (annotationMap map[string]string, err error) {
-	//ta.Lock()
-	//defer ta.Unlock()
+	// ta.Lock()
+	// defer ta.Unlock()
 	cache := ta.allocatedPod.GetCache(string(pod.UID))
 	if cache == nil {
 		msg := fmt.Sprintf("failed to get pod %s from allocatedPod cache", pod.UID)
@@ -1127,12 +1192,14 @@ func vDeviceAnnotationStr(nodes []*nvtree.NvidiaNode) string {
 
 func getCandidatePods(client kubernetes.Interface, hostname string) ([]*v1.Pod, error) {
 	candidatePods := []*v1.Pod{}
+	// 先获取节点上所有的 pod
 	allPods, err := getPodsOnNode(client, hostname, string(v1.PodPending))
 	if err != nil {
 		return candidatePods, err
 	}
 	for _, pod := range allPods {
 		current := pod
+		// 从节点上的 pod 中选取需要 GPU 但还没分配 GPU，且应该不会删除的 pod
 		if utils.IsGPURequiredPod(&current) && !utils.IsGPUAssignedPod(&current) && !utils.ShouldDelete(&current) {
 			candidatePods = append(candidatePods, &current)
 		}
@@ -1147,6 +1214,9 @@ func getCandidatePods(client kubernetes.Interface, hostname string) ([]*v1.Pod, 
 		}
 	}
 
+	// 得到一个候选 pod 列表，对这个列表根据时间排序，即可拿到最先被调度的 pod
+	// 这里默认了一个前提，最先调度的 pod 会最先发出分配请求
+	// 排序依据的时间有两个选择：预选时间和创建时间
 	return OrderPodsdByPredicateTime(candidatePods), nil
 }
 
@@ -1238,3 +1308,29 @@ func (ta *NvidiaTopoAllocator) writeCheckpoint() {
 		klog.Warningf("Failed to write checkpoint due to %s", err.Error())
 	}
 }
+
+// 问题：
+//
+// 问题 A: 为什么要大费周章的通过 grpc，直接挂载容器配置文件可行吗？
+// 总结： 这一点在上面的阅读中可以发现，这时候容器本身对自己应该限制多少的 gpu 资源调用并不知道。这个问题得和 B/C/D 问题结合来看。因为做　Allocate 调用时，kubelet 并没有告知此时在为哪个容器请求配置。因此只能根据请求的资源量以及 Pod 的 predicateTime 或 createTime 来判断。这个是无法保证一定准确的，因此此时容器的具体资源配置也无法确定。可能这就是要通过 grpc 而不是挂载容器配置文件的原因吧。
+//
+// 问题 B: 如果一个 Pod 中有多个 vcore 请求一致，但是 vmemory 不同的容器，这里只通过 vcore 的请求量来判断，可以保证这个分配请求和我们的候选容器能对的上吗？
+// 总结：问题 B 是在 unfinisedPod 中查找当前请求的容器。只要能保证 unfinishedPod 是正确的（问题 D 说明不能保证），那么就可以保证容器是对的上的（问题 C 保证了这个结论）。
+//
+// 问题 C: AllocateRequest 是按照 Pod 中的容器顺序来的?
+// 总结：对于这个问题，最好的回答方式是去看 kubelet 的源代码。
+//
+// for _, container := range pod.Spec.Containers {
+//     if err := m.allocateContainerResources(pod, &container, devicesToReuse); err != nil {
+//         return err
+//     }
+//     m.podDevices.removeContainerAllocatedResources(string(pod.UID), container.Name, devicesToReuse)
+// }
+//
+// 这边做 Allocate 的时候，是顺序遍历 Pod 中的容器，因此这个问题的答案是肯定的。
+//
+// 问题 D: 遍历当前节点上的所有 pod，然后挑出需要 gpu 资源的 pod，根据 predicatedTime 或 createTime 排序。然后再从这些 pod 中， 按顺序挑出符合这次请求的容器，怎么保证挑出来的容器就是这次分配请求的呢？
+// 总结：我觉得回答这个问题，需要确定两个大前提，一是 Pod 从创建到发起 Allocate 的过程，都是顺序的。这样就能保证当调用 Allocate 对应的 Pod 永远是尚未分配到资源的第一个。二是在一个 Pod 中，为每个容器 Allocate 时，也是顺序的，这一点在问题 C 中得到确认。
+// 但是实际上，第一个前提是不能保证的，在 Pod bind 到节点时，这个是并发执行的。因此可以得出一个结论：在这个阶段无法保证 Allocate 请求和我们的候选容器是对应关系。关于这一点我也提了个 issue：a question about Allocate for a container?。官方也给了回答，因为这个原因 gpu manager 有时候会报 UnexpectedAdmissionError 错误。
+// 所以根据问题 4，我们还要使用 gpu-admission 这个项目，来保证该阶段的正确性，具体机制还得等到看 gpu-admission 的时候才能知道了。
+// 其实以上四个问题都是因为 kubelet 的 Allocate 请求不会带上正在分配的容器。所以需要一系列的查找方式来确定具体的容器。

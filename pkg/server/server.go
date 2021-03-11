@@ -325,6 +325,7 @@ func (m *managerImpl) Version(ctx context.Context, req *google_protobuf1.Empty) 
 // Device Plugin 的注册
 
 // Device Plugin 工作时序图
+// ------------------------------------------------------------------------------------------------------------------------
 // [device plugin]										 [kubelet]						[api server]				 [user]
 //		| -> 注册 (Unix socket, api server. ResourceName) ->	|								|							|
 //		| -> ListAnWatch 发送当前节点上的设备资源 Foo		 ->	|								|							|
@@ -333,6 +334,7 @@ func (m *managerImpl) Version(ctx context.Context, req *google_protobuf1.Empty) 
 //		|													| <- 根据节点状态进行 pod 调度	 <-	|							|
 //		| <- 调用 Allocate 进行资源分配						|								|							|
 // [device plugin]										 [kubelet]						[api server]				 [user]
+// ------------------------------------------------------------------------------------------------------------------------
 
 // gpu-manager 的注册方法
 // 这里分别注册了 vcuda 和 vmemory
@@ -370,18 +372,19 @@ func (m *managerImpl) RegisterToKubelet() error {
 // 至此，gpu-manager 的启动流程结束
 // 接下来 gpu-manager 的职责就是等待 kubelet 通过 grpc 调用
 
-//
-//										|- vcore
-//										|- vmemroy
-//					|- server			|- display
-//										|- metrics
-//
-//					|- virtualmanger	|- vcuda
-//
-//	｜- gpu-manager	|- volume manager
-//
-// 					|- allocator
-//
-//										｜- link
-//					|- nvidia 的拓扑感知	｜- share
-//										｜- fragment
+// |--------------------------------------------------------
+// |										|- vcore
+// |										|- vmemroy
+// |					|- server			|- display
+// |										|- metrics
+// |
+// |					|- virtualmanger	|- vcuda
+// |
+// |	｜- gpu-manager	|- volume manager
+// |
+// | 					|- allocator
+// |
+// |										｜- link
+// |					|- nvidia 的拓扑感知	｜- share
+// |										｜- fragment
+// |--------------------------------------------------------

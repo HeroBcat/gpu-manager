@@ -249,6 +249,11 @@ func ShouldDelete(pod *v1.Pod) bool {
 	return false
 }
 
+// 判断这个 pod 是否真的经过预选阶段
+// 满足三个要求才算经过了预选：
+// - resource 字段请求了 vcore 和 vmemory，并且大雨 0
+// - 必须有 tencent.com/predicate-time 字段
+// - 没有分配 gpu 资源
 func IsGPUPredicatedPod(pod *v1.Pod) (predicated bool) {
 	klog.V(4).Infof("Determine if the pod %s needs GPU resource", pod.Name)
 	var ok bool
@@ -302,7 +307,10 @@ func IsGPUAssignedPod(pod *v1.Pod) bool {
 	return true
 }
 
+// 排序依据的时间有两个选择：预选时间或创建时间
 func GetPredicateTimeOfPod(pod *v1.Pod) (predicateTime uint64) {
+	// 预选时间由 gpu-admission 添加
+	// 如果没有预选时间就使用 pod 的创建时间
 	if predicateTimeStr, ok := pod.ObjectMeta.Annotations[types.PredicateTimeAnnotation]; ok {
 		u64, err := strconv.ParseUint(predicateTimeStr, 10, 64)
 		if err != nil {
